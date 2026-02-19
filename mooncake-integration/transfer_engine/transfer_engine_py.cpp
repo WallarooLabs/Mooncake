@@ -22,7 +22,11 @@
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#else
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #endif
 
 #ifdef USE_INTRA_NVLINK
@@ -47,6 +51,15 @@ void initMemoryAllocator(const char *protocol) {
     g_protocol = protocol;
     if (strcmp(protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::HipTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::HipTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MNNVL (HIP) memory allocator";
+#else
         allocateMemory = [](size_t s) -> void * {
             return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
         };
@@ -54,6 +67,7 @@ void initMemoryAllocator(const char *protocol) {
             mooncake::NvlinkTransport::freePinnedLocalMemory(p);
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
+#endif
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif

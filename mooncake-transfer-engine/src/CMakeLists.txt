@@ -76,7 +76,21 @@ endif()
 
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
-  target_link_libraries(transfer_engine PUBLIC hip::host rt)
+
+  # Find HSA runtime library for DMA-BUF support
+  find_library(HSA_RUNTIME_LIBRARY
+    NAMES hsa-runtime64
+    PATHS /opt/rocm/lib /opt/rocm/hsa/lib ${ROCM_PATH}/lib ${ROCM_PATH}/hsa/lib
+    NO_DEFAULT_PATH
+  )
+
+  if(HSA_RUNTIME_LIBRARY)
+    message(STATUS "Found HSA runtime: ${HSA_RUNTIME_LIBRARY}")
+    target_link_libraries(transfer_engine PUBLIC hip::host ${HSA_RUNTIME_LIBRARY} rt)
+  else()
+    message(WARNING "HSA runtime library not found, DMA-BUF support may be limited")
+    target_link_libraries(transfer_engine PUBLIC hip::host rt)
+  endif()
 endif()
 
 if (USE_ASCEND)

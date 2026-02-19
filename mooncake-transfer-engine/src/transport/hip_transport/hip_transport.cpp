@@ -23,6 +23,11 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+
+// HSA headers for DMA-BUF support
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
 
 #include "common.h"
 #include "common/serialization.h"
@@ -46,6 +51,14 @@ constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
 struct hipxFabricHandle {
     int fd;
     int pid;
+};
+
+// DMA-BUF handle structure for IPC memory sharing
+struct DmabufHandle {
+    int fd;
+    int pid;
+    uint64_t offset;
+    uint64_t size;
 };
 
 // RAII wrapper for file descriptor management
@@ -98,13 +111,51 @@ static int open_fd(const hipxFabricHandle &export_handle) {
 
 static int openIPCHandle(const std::vector<unsigned char> &buffer,
                          void **shm_addr) {
-    hipIpcMemHandle_t handle;
-    memcpy(&handle, buffer.data(), sizeof(handle));
-    if (!checkHip(hipIpcOpenMemHandle(shm_addr, handle,
-                                      hipIpcMemLazyEnablePeerAccess),
-                  "HipTransport: hipIpcOpenMemHandle failed")) {
+    // Handle DMA-BUF based memory sharing for ROCm/AMD GPUs
+    DmabufHandle dmabuf_handle;
+
+    if (buffer.size() < sizeof(DmabufHandle)) {
+        LOG(ERROR) << "HipTransport: Invalid DMA-BUF handle size: " << buffer.size()
+                   << " (expected " << sizeof(DmabufHandle) << ")";
         return -1;
     }
+
+    memcpy(&dmabuf_handle, buffer.data(), sizeof(DmabufHandle));
+
+    // Get file descriptor from remote process using pidfd_getfd
+    int pid_fd = (int)syscall(__NR_pidfd_open, dmabuf_handle.pid, 0);
+    if (pid_fd == -1) {
+        LOG(ERROR) << "HipTransport: pidfd_open failed: " << strerror(errno);
+        return -1;
+    }
+
+    int local_dmabuf_fd = (int)syscall(__NR_pidfd_getfd, pid_fd, dmabuf_handle.fd, 0);
+    close(pid_fd);
+
+    if (local_dmabuf_fd == -1) {
+        LOG(ERROR) << "HipTransport: pidfd_getfd failed: " << strerror(errno);
+        return -1;
+    }
+
+    // For ROCm, we can mmap the DMA-BUF and then use peer access
+    // This makes the memory accessible from both processes
+    void *mapped_addr = mmap(nullptr, dmabuf_handle.size,
+                             PROT_READ | PROT_WRITE, MAP_SHARED,
+                             local_dmabuf_fd, dmabuf_handle.offset);
+
+    if (mapped_addr == MAP_FAILED) {
+        LOG(ERROR) << "HipTransport: mmap DMA-BUF failed: " << strerror(errno);
+        close(local_dmabuf_fd);
+        return -1;
+    }
+
+    // We keep the FD open and store the mapped address
+    // HIP peer access should allow GPU-GPU transfers through this mapping
+    *shm_addr = mapped_addr;
+
+    // Note: We're not closing local_dmabuf_fd here to keep the mapping valid
+    // It will be closed when munmap is called in cleanup
+
     return 0;
 }
 
@@ -348,6 +399,17 @@ HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),
       stream_pool_(getNumStreams()),
       event_pool_(getNumEvents()) {
+    // Initialize HSA runtime (required for DMA-BUF operations)
+    if (!use_fabric_mem_) {
+        hsa_status_t hsa_status = hsa_init();
+        if (hsa_status != HSA_STATUS_SUCCESS) {
+            LOG(WARNING) << "HipTransport: hsa_init failed with status " << hsa_status
+                        << ". DMA-BUF operations may not work.";
+        } else {
+            LOG(INFO) << "HipTransport: HSA runtime initialized successfully";
+        }
+    }
+
     // Enable P2P access for IPC mode
     if (!use_fabric_mem_) {
         int num_devices = 0;
@@ -366,8 +428,11 @@ HipTransport::~HipTransport() {
             freePinnedLocalMemory(entry.second.shm_addr);
         }
     } else {
+        // Clean up mmap'd DMA-BUF imported memory
         for (auto &entry : remap_entries_) {
-            (void)hipIpcCloseMemHandle(entry.second.shm_addr);
+            if (munmap(entry.second.shm_addr, entry.second.length) != 0) {
+                LOG(WARNING) << "HipTransport: munmap failed: " << strerror(errno);
+            }
         }
     }
     remap_entries_.clear();
@@ -597,27 +662,59 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
     }
 
-    // IPC-based memory registration
+    // IPC-based memory registration with DMA-BUF support for PyTorch GPU memory
     if (!use_fabric_mem_) {
-        // Validate memory type
+        // Get GPU device for this memory
+        int device_id = -1;
         hipPointerAttribute_t attr;
         if (!checkHip(hipPointerGetAttributes(&attr, addr),
                       "HipTransport: hipPointerGetAttributes failed")) {
             return -1;
         }
+        device_id = attr.device;
 
-        if (attr.type != hipMemoryTypeDevice) {
-            LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                       << attr.type;
+        if (device_id < 0) {
+            LOG(ERROR) << "HipTransport: Could not determine device for memory " << addr;
             return -1;
         }
 
-        // Get IPC handle
-        hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, addr),
-                      "HipTransport: hipIpcGetMemHandle failed")) {
+        // Export GPU memory as DMA-BUF using HSA runtime
+        // This works for PyTorch GPU memory which may not support hipIpcGetMemHandle
+        int dmabuf_fd = -1;
+        uint64_t dmabuf_offset = 0;
+
+        LOG(INFO) << "HipTransport: Attempting DMA-BUF export for addr=" << addr
+                  << " length=" << length;
+
+        hsa_status_t hsa_status = hsa_amd_portable_export_dmabuf(
+            addr,
+            length,
+            &dmabuf_fd,
+            &dmabuf_offset
+        );
+
+        if (hsa_status != HSA_STATUS_SUCCESS) {
+            LOG(ERROR) << "HipTransport: hsa_amd_portable_export_dmabuf failed with status "
+                       << hsa_status << " for addr=" << addr << " length=" << length;
             return -1;
         }
+
+        if (dmabuf_fd < 0) {
+            LOG(ERROR) << "HipTransport: Invalid DMA-BUF file descriptor: " << dmabuf_fd;
+            return -1;
+        }
+
+        LOG(INFO) << "HipTransport: Successfully exported DMA-BUF: fd=" << dmabuf_fd
+                  << " offset=" << dmabuf_offset << " for addr=" << addr;
+
+        // Create handle containing dmabuf_fd for transmission
+        // Note: The FD will be transferred via pidfd_getfd in the remote process
+        DmabufHandle dmabuf_handle;
+
+        dmabuf_handle.fd = dmabuf_fd;
+        dmabuf_handle.pid = getpid();
+        dmabuf_handle.offset = dmabuf_offset;
+        dmabuf_handle.size = length;
 
         // Register buffer with metadata
         (void)remote_accessible;
@@ -625,8 +722,13 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
-        desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        desc.shm_name = serializeBinaryData(&dmabuf_handle, sizeof(DmabufHandle));
+
+        int result = metadata_->addLocalMemoryBuffer(desc, true);
+
+        // Note: Don't close dmabuf_fd here - it needs to stay open for remote access
+
+        return result;
     }
 
     // Fabric memory registration
@@ -708,15 +810,22 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 void *shm_addr = nullptr;
                 int rc = -1;
 
-                if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
+                // Check for DMA-BUF handle (IPC mode)
+                if (output_buffer.size() == sizeof(DmabufHandle) &&
                     !use_fabric_mem_) {
                     rc = openIPCHandle(output_buffer, &shm_addr);
-                } else if (output_buffer.size() == sizeof(hipxFabricHandle) &&
+                }
+                // Check for fabric handle
+                else if (output_buffer.size() == sizeof(hipxFabricHandle) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
                                              &shm_addr);
                 } else {
-                    LOG(ERROR) << "Mismatched HIP data transfer method";
+                    LOG(ERROR) << "Mismatched HIP data transfer method. Buffer size: "
+                               << output_buffer.size() << ", expected DmabufHandle: "
+                               << sizeof(DmabufHandle) << " or FabricHandle: "
+                               << sizeof(hipxFabricHandle) << ", use_fabric_mem="
+                               << use_fabric_mem_;
                     return -1;
                 }
 

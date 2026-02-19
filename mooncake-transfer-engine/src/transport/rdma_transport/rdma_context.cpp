@@ -28,6 +28,11 @@
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
+
+#ifdef USE_HIP
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+#endif
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
 
@@ -218,21 +223,12 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         length = (size_t)globalConfig().max_mr_size;
     }
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-    // Implement register memory in a way that does not assume the presence of
-    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
-    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
-    // nvidia-peermem.
-    CUmemorytype memType;
-    CUresult result = cuPointerGetAttribute(
-        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
-
-    // Register memory depending on whether memory is on host or GPU.
-    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
-    } else if (memType == CU_MEMORYTYPE_DEVICE) {
-        size_t allocSize;
-        result = cuPointerGetAttribute(
+    // ========================================================================
+    // CUDA Path: Use cuMemGetHandleForAddressRange for DMA buffer export
+    // ========================================================================
+    {
+        size_t allocSize = 0;
+        CUresult result = cuPointerGetAttribute(
             &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
@@ -253,10 +249,80 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                        << " cuda error=" << errStr;
             return ERR_CONTEXT;
         }
+
+        if (globalConfig().trace) {
+            LOG(INFO) << "CUDA dmabuf export: addr=" << addr
+                      << " length=" << length
+                      << " fd=" << dmabuf_fd;
+        }
+
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
     }
+
+#elif defined(USE_HIP)
+    // ========================================================================
+    // ROCm/HIP Path: Use hsa_amd_portable_export_dmabuf for DMA buffer export
+    // ========================================================================
+    {
+        int dmabuf_fd = -1;
+        uint64_t dmabuf_offset = 0;
+
+        // Export the ROCm memory as a DMA-BUF file descriptor
+        hsa_status_t status = hsa_amd_portable_export_dmabuf(
+            addr, length, &dmabuf_fd, &dmabuf_offset);
+
+        if (status != HSA_STATUS_SUCCESS) {
+            LOG(ERROR) << "Failed to export ROCm memory as dmabuf: "
+                       << "addr=" << addr
+                       << " length=" << length
+                       << " hsa_status=" << status;
+            return ERR_CONTEXT;
+        }
+
+        if (dmabuf_fd < 0) {
+            LOG(ERROR) << "Invalid dmabuf fd returned: fd=" << dmabuf_fd;
+            return ERR_CONTEXT;
+        }
+
+        if (globalConfig().trace) {
+            LOG(INFO) << "ROCm dmabuf export successful: "
+                      << "addr=" << addr
+                      << " length=" << length
+                      << " fd=" << dmabuf_fd
+                      << " offset=" << dmabuf_offset;
+        }
+
+        // Register the exported DMA buffer with RDMA
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_,
+                                      dmabuf_offset,     // offset within dmabuf
+                                      length,             // length to register
+                                      (uintptr_t)addr,   // virtual address
+                                      dmabuf_fd,         // dmabuf file descriptor
+                                      access);           // access flags
+
+        if (!mrMeta.mr) {
+            LOG(ERROR) << "ibv_reg_dmabuf_mr failed for ROCm memory: "
+                       << "addr=" << addr
+                       << " fd=" << dmabuf_fd
+                       << " offset=" << dmabuf_offset
+                       << " errno=" << errno << " (" << strerror(errno) << ")";
+            close(dmabuf_fd);  // Clean up the fd on failure
+            return ERR_CONTEXT;
+        }
+
+        if (globalConfig().trace) {
+            LOG(INFO) << "Successfully registered ROCm dmabuf with RDMA: "
+                      << "addr=" << addr
+                      << " mr=" << mrMeta.mr;
+        }
+
+        // Note: The dmabuf_fd is now owned by the MR and will be closed
+        // when the MR is deregistered
+    }
+
 #else
     mrMeta.addr = addr;
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);

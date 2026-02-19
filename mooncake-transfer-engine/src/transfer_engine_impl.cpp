@@ -244,6 +244,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
         if (force_mnnvl || local_topology_->getHcaList().empty()) {
+#ifdef USE_HIP
+            Transport* t =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install HIP transport";
+                return -1;
+            }
+            LOG(INFO) << "Using HIP transport "
+                      << "(USE_HIP and no HCA detected)";
+#else
             Transport* t =
                 multi_transports_->installTransport("nvlink", nullptr);
             if (!t) {
@@ -252,6 +262,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using cross-node NVLink transport "
                       << "(MC_FORCE_MNNVL or no HCA detected)";
+#endif
         } else if (intra_env) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
